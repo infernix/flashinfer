@@ -1710,6 +1710,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._forced_cudnn_paged_prefill = False
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2047,11 +2048,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cached_o_data_type = o_data_type
         self._backend = self._requested_backend
         self._cached_module = None
+        self._forced_cudnn_paged_prefill = False
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if _should_force_cudnn_for_paged_prefill(
+            force_cudnn = _should_force_cudnn_for_paged_prefill(
                 self._backend,
                 self.device,
                 self._kv_layout,
@@ -2065,8 +2067,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_data_type,
                 kv_data_type,
                 o_data_type,
-            ):
+            )
+            if force_cudnn:
                 self._backend = "cudnn"
+                self._forced_cudnn_paged_prefill = True
             elif self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
@@ -2112,16 +2116,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._block_tables = self._block_tables.to(
                     self.device, non_blocking=non_blocking
                 )
-            qo_indptr_cudnn = _get_cudnn_qo_indptr(
-                qo_indptr_host, num_qo_heads, head_dim_qk
-            )
-            self._qo_indptr_last = int(qo_indptr_cudnn[-1])
-            if self.is_cuda_graph_enabled:
-                self._qo_indptr_buf.copy_(qo_indptr_cudnn, non_blocking=non_blocking)
-            else:
-                self._qo_indptr_buf = qo_indptr_cudnn.to(
-                    self.device, non_blocking=non_blocking
+            if not self._forced_cudnn_paged_prefill:
+                qo_indptr_cudnn = _get_cudnn_qo_indptr(
+                    qo_indptr_host, num_qo_heads, head_dim_qk
                 )
+                self._qo_indptr_last = int(qo_indptr_cudnn[-1])
+                if self.is_cuda_graph_enabled:
+                    self._qo_indptr_buf.copy_(qo_indptr_cudnn, non_blocking=non_blocking)
+                else:
+                    self._qo_indptr_buf = qo_indptr_cudnn.to(
+                        self.device, non_blocking=non_blocking
+                    )
         elif self._backend == "trtllm-gen":
             if not causal:
                 raise NotImplementedError(
@@ -2326,7 +2331,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            if q.numel() != self._qo_indptr_last:
+            if self._forced_cudnn_paged_prefill:
+                if q.size(0) != self._qo_indptr_last:
+                    raise ValueError(
+                        f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
+                        f"For forced cudnn paged prefill fallback, qo_indptr remains token offsets."
+                    )
+            elif q.numel() != self._qo_indptr_last:
                 raise ValueError(
                     f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For cudnn paged prefill, qo_indptr uses element offsets "
@@ -2451,6 +2462,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
+            cudnn_qo_indptr = (
+                _get_cudnn_qo_indptr(self._qo_indptr_buf, q.size(1), q.size(2))
+                if self._forced_cudnn_paged_prefill
+                else self._qo_indptr_buf
+            )
+            cudnn_o_indptr = (
+                _get_cudnn_qo_indptr(self._qo_indptr_buf, q.size(1), out_head_dim)
+                if self._forced_cudnn_paged_prefill
+                else self._qo_indptr_buf
+            )
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed
@@ -2467,8 +2488,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_o=self._qo_indptr_buf,
+                batch_offsets_q=cudnn_qo_indptr,
+                batch_offsets_o=cudnn_o_indptr,
                 out=out,
                 lse=lse,
                 o_data_type=out_dtype,

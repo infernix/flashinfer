@@ -302,10 +302,10 @@ def test_paged_prefill_selects_cudnn_for_large_head_dim(use_cuda_graph):
         causal=True,
     )
 
-    expected_qo_indptr_last = int(qo_indptr[-1]) * num_qo_heads * head_dim
     assert wrapper._backend == "cudnn"
-    assert wrapper._qo_indptr_last == expected_qo_indptr_last
-    assert wrapper._qo_indptr_buf[-1].item() == expected_qo_indptr_last
+    assert wrapper._forced_cudnn_paged_prefill is True
+    assert wrapper._qo_indptr_last == int(qo_indptr[-1])
+    assert wrapper._qo_indptr_buf[-1].item() == int(qo_indptr[-1])
     assert wrapper._block_tables is not None
     assert wrapper._block_tables.shape == (batch_size, kv_len)
 
@@ -351,3 +351,92 @@ def test_paged_prefill_cudnn_fallback_rejects_sinks():
 
     with pytest.raises(NotImplementedError, match="does not support sinks"):
         wrapper.run(q, (k_cache, v_cache), sinks=torch.zeros(1, device=device))
+
+
+def test_paged_prefill_cudnn_fallback_uses_runtime_q_shape(monkeypatch):
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device)[0] != 8:
+        pytest.skip("regression targets non-hopper FA2 devices")
+
+    batch_size = 2
+    qo_len = 4
+    kv_len = 8
+    page_size = 1
+    plan_head_dim = 512
+    run_head_dim = 256
+    run_out_head_dim = 128
+    num_qo_heads = 8
+    num_kv_heads = 2
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    paged_kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * kv_len
+    paged_kv_indices = torch.arange(batch_size * kv_len, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+    q = torch.randn(
+        batch_size * qo_len,
+        num_qo_heads,
+        run_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k_cache = torch.randn(
+        batch_size * kv_len,
+        page_size,
+        num_kv_heads,
+        run_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn(
+        batch_size * kv_len,
+        page_size,
+        num_kv_heads,
+        run_out_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, backend="auto")
+    wrapper.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        plan_head_dim,
+        page_size,
+        head_dim_vo=plan_head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        causal=True,
+    )
+
+    captured = {}
+
+    def fake_cudnn_batch_prefill_with_kv_cache(
+        q,
+        k_cache,
+        v_cache,
+        sm_scale,
+        workspace_buffer,
+        *,
+        batch_offsets_q,
+        batch_offsets_o,
+        out,
+        lse,
+        **kwargs,
+    ):
+        captured["batch_offsets_q"] = batch_offsets_q.clone()
+        captured["batch_offsets_o"] = batch_offsets_o.clone()
+        return (out, lse) if lse is not None else out
+
+    monkeypatch.setattr(
+        "flashinfer.prefill.cudnn_batch_prefill_with_kv_cache",
+        fake_cudnn_batch_prefill_with_kv_cache,
+    )
+
+    wrapper.run(q, (k_cache, v_cache))
+    expected_q = qo_indptr.to(device) * (num_qo_heads * run_head_dim)
+    expected_o = qo_indptr.to(device) * (num_qo_heads * run_out_head_dim)
+    torch.testing.assert_close(captured["batch_offsets_q"], expected_q)
+    torch.testing.assert_close(captured["batch_offsets_o"], expected_o)
