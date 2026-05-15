@@ -223,6 +223,20 @@ def get_batch_decode_jit_module(module_name: str, jit_module: Any):
         run=run_batch_decode,
     )
 
+ 
+def _can_use_fa2_tensor_cores_for_decode(
+    head_dim: int,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+) -> bool:
+    if head_dim != 512:
+        return True
+    return not (
+        q_data_type in (torch.float16, torch.bfloat16)
+        and kv_data_type in (torch.float16, torch.bfloat16)
+        and o_data_type in (torch.float16, torch.bfloat16)
+    )
 
 @functools.cache
 def get_batch_decode_module(*args):
@@ -791,7 +805,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._paged_kv_indptr_buf = paged_kv_indptr_buffer
         self._paged_kv_indices_buf = paged_kv_indices_buffer
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buffer
-        self._use_tensor_cores = use_tensor_cores or backend == "trtllm-gen"
+        self._requested_use_tensor_cores = use_tensor_cores or backend == "trtllm-gen"
+        self._use_tensor_cores = self._requested_use_tensor_cores
         self._use_cuda_graph = use_cuda_graph
 
         if use_tensor_cores:
@@ -991,6 +1006,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
+        self._use_tensor_cores = self._requested_use_tensor_cores
+        if (
+            self._use_tensor_cores
+            and self._backend in ("auto", "fa2")
+            and self._jit_module is None
+            and not _can_use_fa2_tensor_cores_for_decode(
+                head_dim, q_data_type, kv_data_type, o_data_type
+            )
+        ):
+            self._use_tensor_cores = False
         if fixed_split_size is not None and not self.use_tensor_cores:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."

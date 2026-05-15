@@ -1,6 +1,8 @@
+import math
 import pytest
 import torch
 
+import flashinfer
 from flashinfer import BatchPrefillWithPagedKVCacheWrapper
 
 
@@ -118,3 +120,126 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype):
     )
     out3_ref, _ = wrapper.forward_return_lse(q * k_scale, paged_kv_cache)
     torch.testing.assert_close(out3, out3_ref * v_scale, rtol=1e-2, atol=1e-3)
+
+
+def _paged_attention_ref(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    paged_kv_last_page_len: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    page_size = k_cache.shape[1]
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    group_size = num_qo_heads // num_kv_heads
+    outputs = []
+
+    qo_indptr_cpu = qo_indptr.cpu()
+    paged_kv_indptr_cpu = paged_kv_indptr.cpu()
+    paged_kv_indices_cpu = paged_kv_indices.cpu()
+    paged_kv_last_page_len_cpu = paged_kv_last_page_len.cpu()
+
+    for request_idx in range(len(qo_indptr_cpu) - 1):
+        q_begin = qo_indptr_cpu[request_idx].item()
+        q_end = qo_indptr_cpu[request_idx + 1].item()
+        page_begin = paged_kv_indptr_cpu[request_idx].item()
+        page_end = paged_kv_indptr_cpu[request_idx + 1].item()
+        page_indices = paged_kv_indices_cpu[page_begin:page_end].to(q.device)
+        kv_len = (page_end - page_begin - 1) * page_size
+        kv_len += paged_kv_last_page_len_cpu[request_idx].item()
+
+        k = k_cache.index_select(0, page_indices).reshape(-1, num_kv_heads, k_cache.shape[-1])[
+            :kv_len
+        ]
+        v = v_cache.index_select(0, page_indices).reshape(-1, num_kv_heads, v_cache.shape[-1])[
+            :kv_len
+        ]
+        k = k.repeat_interleave(group_size, dim=1).float()
+        v = v.repeat_interleave(group_size, dim=1).float()
+        qi = q[q_begin:q_end].float()
+
+        scores = torch.einsum("qhd,khd->hqk", qi, k) * sm_scale
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khv->qhv", probs, v).to(v_cache.dtype))
+
+    return torch.cat(outputs, dim=0)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_tensor_core_decode_falls_back_for_large_head_dim_bfloat16(use_cuda_graph):
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device)[0] != 8:
+        pytest.skip("regression targets FA2 on Ampere/Ada GPUs")
+
+    torch.manual_seed(0)
+    batch_size = 2
+    kv_len = 8
+    page_size = 1
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 512
+    dtype = torch.bfloat16
+    total_num_pages = batch_size * kv_len
+
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k_cache = torch.randn(
+        total_num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32)
+    paged_kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * kv_len
+    paged_kv_indices = torch.arange(total_num_pages, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    if use_cuda_graph:
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "NHD",
+            use_cuda_graph=True,
+            paged_kv_indptr_buffer=torch.empty(
+                batch_size + 1, dtype=torch.int32, device=device
+            ),
+            paged_kv_indices_buffer=torch.empty(
+                total_num_pages, dtype=torch.int32, device=device
+            ),
+            paged_kv_last_page_len_buffer=torch.empty(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            use_tensor_cores=True,
+        )
+    else:
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace_buffer,
+            "NHD",
+            use_tensor_cores=True,
+        )
+
+    wrapper.plan(
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+
+    out = wrapper.run(q, (k_cache, v_cache))
+    ref = _paged_attention_ref(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        1.0 / math.sqrt(head_dim),
+    )
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)

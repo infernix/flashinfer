@@ -88,6 +88,76 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
     return 1;
   }
 }
+ 
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          uint32_t NUM_WARPS_KV, typename DTypeQ, typename DTypeKV>
+inline uint32_t get_max_num_mma_kv_smem(const int max_smem_per_sm) {
+  constexpr size_t q_smem_size = CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ);
+  constexpr size_t kv_smem_size_per_mma =
+      (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV);
+  constexpr size_t min_smem_size = q_smem_size + kv_smem_size_per_mma;
+
+  const int num_ctas_per_sm =
+      static_cast<size_t>(max_smem_per_sm) >= 2 * min_smem_size ? 2 : 1;
+  const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
+  if (max_smem_per_threadblock <= 0 ||
+      static_cast<size_t>(max_smem_per_threadblock) <= q_smem_size) {
+    return 0;
+  }
+  return static_cast<uint32_t>(
+      (static_cast<size_t>(max_smem_per_threadblock) - q_smem_size) /
+      kv_smem_size_per_mma);
+}
+
+template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+          typename DTypeQ, typename DTypeKV>
+inline uint32_t get_prefill_num_warps_kv(const int max_smem_per_sm,
+                                         const uint32_t max_num_mma_kv_reg) {
+  constexpr uint32_t default_num_warps_kv = get_num_warps_kv(CTA_TILE_Q);
+  const uint32_t default_max_mma_kv =
+      get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
+                              default_num_warps_kv, DTypeQ, DTypeKV>(
+          max_smem_per_sm);
+  if ((default_max_mma_kv < max_num_mma_kv_reg ? default_max_mma_kv : max_num_mma_kv_reg) >= 1) {
+    return default_num_warps_kv;
+  }
+
+  if constexpr (CTA_TILE_Q == 16 && default_num_warps_kv > 2) {
+    const uint32_t max_mma_kv_2 =
+        get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, 2, DTypeQ,
+                                DTypeKV>(max_smem_per_sm);
+    if ((max_mma_kv_2 < max_num_mma_kv_reg ? max_mma_kv_2 : max_num_mma_kv_reg) >= 1) {
+      return 2;
+    }
+  }
+
+  if constexpr (CTA_TILE_Q == 16 && default_num_warps_kv > 1) {
+    const uint32_t max_mma_kv_1 =
+        get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, 1, DTypeQ,
+                                DTypeKV>(max_smem_per_sm);
+    if ((max_mma_kv_1 < max_num_mma_kv_reg ? max_mma_kv_1 : max_num_mma_kv_reg) >= 1) {
+      return 1;
+    }
+  }
+
+  return default_num_warps_kv;
+}
+
+#define DISPATCH_NUM_WARPS_KV(num_warps_kv, NUM_WARPS_KV, ...)    \
+  if (num_warps_kv == 4) {                                        \
+    constexpr uint32_t NUM_WARPS_KV = 4;                          \
+    __VA_ARGS__                                                    \
+  } else if (num_warps_kv == 2) {                                 \
+    constexpr uint32_t NUM_WARPS_KV = 2;                          \
+    __VA_ARGS__                                                    \
+  } else if (num_warps_kv == 1) {                                 \
+    constexpr uint32_t NUM_WARPS_KV = 1;                          \
+    __VA_ARGS__                                                    \
+  } else {                                                        \
+    std::ostringstream err_msg;                                   \
+    err_msg << "Unsupported num_warps_kv: " << num_warps_kv;      \
+    FLASHINFER_ERROR(err_msg.str());                              \
+  }
 
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
@@ -1904,7 +1974,6 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-    constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
     constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
 
     using DTypeQKAccum =
@@ -1916,25 +1985,23 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     int max_smem_per_sm = 0;
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
         &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-    // we expect each sm execute two threadblocks
-    const int num_ctas_per_sm =
-        max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                                (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-            ? 2
-            : 1;
-    const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
     const uint32_t max_num_mma_kv_reg =
         (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
          !USE_FP16_QK_REDUCTION)
             ? 2
             : (8 / NUM_MMA_Q);
-    const uint32_t max_num_mma_kv_smem =
-        (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-        ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+    const uint32_t num_warps_kv =
+        get_prefill_num_warps_kv<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV>(
+            max_smem_per_sm, max_num_mma_kv_reg);
 
-    // control NUM_MMA_KV for maximum warp occupancy
-    DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
+    DISPATCH_NUM_WARPS_KV(num_warps_kv, NUM_WARPS_KV, {
+      const uint32_t max_num_mma_kv_smem =
+          get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, NUM_WARPS_KV, DTypeQ,
+                                  DTypeKV>(max_smem_per_sm);
+
+      // control NUM_MMA_KV for maximum warp occupancy
+      DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
       using KTraits =
           KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                        NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
@@ -2003,6 +2070,7 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
         }
       }
     })
+    })  // DISPATCH_NUM_WARPS_KV
   });
   return cudaSuccess;
 }
@@ -2797,7 +2865,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   const uint32_t num_kv_heads = params.num_kv_heads;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
 
   if (padded_batch_size == 0) {
     // No request, skip
@@ -2806,7 +2873,6 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   }
 
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
-  dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   using DTypeQKAccum =
@@ -2818,24 +2884,23 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-  // we expect each sm execute two threadblocks
-  const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-          ? 2
-          : 1;
-  const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q);
-  const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-      ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+  const uint32_t num_warps_kv =
+      get_prefill_num_warps_kv<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV>(
+          max_smem_per_sm, max_num_mma_kv_reg);
 
-  DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
+  DISPATCH_NUM_WARPS_KV(num_warps_kv, NUM_WARPS_KV, {
+    dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+    const uint32_t max_num_mma_kv_smem =
+        get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, NUM_WARPS_KV, DTypeQ,
+                                DTypeKV>(max_smem_per_sm);
+
+    DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
@@ -2905,6 +2970,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
       }
     }
   });
+  })  // DISPATCH_NUM_WARPS_KV
   return cudaSuccess;
 }
 
@@ -2922,7 +2988,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   const uint32_t num_kv_heads = params.paged_kv.num_heads;
   constexpr uint32_t NUM_MMA_Q = get_num_mma_q(CTA_TILE_Q);
   constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
-  constexpr uint32_t NUM_WARPS_KV = get_num_warps_kv(CTA_TILE_Q);
 
   if (padded_batch_size == 0) {
     // No request, skip
@@ -2931,7 +2996,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   }
 
   dim3 nblks(padded_batch_size, 1, num_kv_heads);
-  dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
 
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
@@ -2944,24 +3008,23 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-  // we expect each sm execute two threadblocks
-  const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-          ? 2
-          : 1;
-  const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
       (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q);
-  const uint32_t max_num_mma_kv_smem =
-      (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
-      ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
+  const uint32_t num_warps_kv =
+      get_prefill_num_warps_kv<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, DTypeQ, DTypeKV>(
+          max_smem_per_sm, max_num_mma_kv_reg);
 
-  DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
+  DISPATCH_NUM_WARPS_KV(num_warps_kv, NUM_WARPS_KV, {
+    dim3 nthrs(32, NUM_WARPS_Q, NUM_WARPS_KV);
+    const uint32_t max_num_mma_kv_smem =
+        get_max_num_mma_kv_smem<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, NUM_WARPS_KV, DTypeQ,
+                                DTypeKV>(max_smem_per_sm);
+
+    DISPATCH_NUM_MMA_KV(min(max_num_mma_kv_smem, max_num_mma_kv_reg), NUM_MMA_KV, {
     using KTraits =
         KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                      NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
@@ -3030,6 +3093,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
       }
     }
   });
+  })  // DISPATCH_NUM_WARPS_KV
   return cudaSuccess;
 }
 
