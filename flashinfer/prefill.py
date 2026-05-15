@@ -58,7 +58,6 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
-    is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
@@ -1368,43 +1367,6 @@ def _compute_page_mask_indptr(
     )
     return mask_indptr
 
- 
-def _should_force_cudnn_for_paged_prefill(
-    backend: str,
-    device: torch.device,
-    kv_layout: str,
-    head_dim_qk: int,
-    head_dim_vo: int,
-    pos_encoding_mode: str,
-    use_fp16_qk_reduction: bool,
-    use_custom_mask: bool,
-    window_left: int,
-    logits_soft_cap: float,
-    q_data_type: torch.dtype,
-    kv_data_type: torch.dtype,
-    o_data_type: torch.dtype,
-) -> bool:
-    if backend not in ("auto", "fa2"):
-        return False
-    if is_sm90a_supported(device):
-        return False
-    if kv_layout != "NHD" or head_dim_qk != 512 or head_dim_vo != 512:
-        return False
-    if (
-        pos_encoding_mode != "NONE"
-        or use_fp16_qk_reduction
-        or use_custom_mask
-        or window_left >= 0
-        or logits_soft_cap != 0.0
-    ):
-        return False
-    supported_dtypes = (torch.float16, torch.bfloat16)
-    return (
-        q_data_type in supported_dtypes
-        and kv_data_type in supported_dtypes
-        and o_data_type in supported_dtypes
-    )
-
 
 def _build_paged_block_tables(
     paged_kv_indptr_host: torch.Tensor,
@@ -1710,7 +1672,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
-        self._forced_cudnn_paged_prefill = False
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -2048,30 +2009,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cached_o_data_type = o_data_type
         self._backend = self._requested_backend
         self._cached_module = None
-        self._forced_cudnn_paged_prefill = False
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            force_cudnn = _should_force_cudnn_for_paged_prefill(
-                self._backend,
-                self.device,
-                self._kv_layout,
-                head_dim_qk,
-                head_dim_vo,
-                pos_encoding_mode,
-                use_fp16_qk_reduction,
-                self._custom_mask_buf is not None,
-                window_left,
-                logits_soft_cap,
-                q_data_type,
-                kv_data_type,
-                o_data_type,
-            )
-            if force_cudnn:
-                self._backend = "cudnn"
-                self._forced_cudnn_paged_prefill = True
-            elif self._backend == "auto":
+            if self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -2116,17 +2058,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._block_tables = self._block_tables.to(
                     self.device, non_blocking=non_blocking
                 )
-            if not self._forced_cudnn_paged_prefill:
-                qo_indptr_cudnn = _get_cudnn_qo_indptr(
-                    qo_indptr_host, num_qo_heads, head_dim_qk
+            qo_indptr_cudnn = _get_cudnn_qo_indptr(
+                qo_indptr_host, num_qo_heads, head_dim_qk
+            )
+            self._qo_indptr_last = int(qo_indptr_cudnn[-1])
+            if self.is_cuda_graph_enabled:
+                self._qo_indptr_buf.copy_(qo_indptr_cudnn, non_blocking=non_blocking)
+            else:
+                self._qo_indptr_buf = qo_indptr_cudnn.to(
+                    self.device, non_blocking=non_blocking
                 )
-                self._qo_indptr_last = int(qo_indptr_cudnn[-1])
-                if self.is_cuda_graph_enabled:
-                    self._qo_indptr_buf.copy_(qo_indptr_cudnn, non_blocking=non_blocking)
-                else:
-                    self._qo_indptr_buf = qo_indptr_cudnn.to(
-                        self.device, non_blocking=non_blocking
-                    )
         elif self._backend == "trtllm-gen":
             if not causal:
                 raise NotImplementedError(
@@ -2331,13 +2272,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         # Validate q shape matches qo_indptr (using value cached in plan() to avoid GPU sync)
         if self._backend == "cudnn":
-            if self._forced_cudnn_paged_prefill:
-                if q.size(0) != self._qo_indptr_last:
-                    raise ValueError(
-                        f"q.shape[0] ({q.size(0)}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
-                        f"For forced cudnn paged prefill fallback, qo_indptr remains token offsets."
-                    )
-            elif q.numel() != self._qo_indptr_last:
+            if q.numel() != self._qo_indptr_last:
                 raise ValueError(
                     f"q.numel() ({q.numel()}) does not match qo_indptr[-1] ({self._qo_indptr_last}). "
                     f"For cudnn paged prefill, qo_indptr uses element offsets "
@@ -2462,16 +2397,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(self._batch_size, 1, 1, 1)
 
-            cudnn_qo_indptr = (
-                _get_cudnn_qo_indptr(self._qo_indptr_buf, q.size(1), q.size(2))
-                if self._forced_cudnn_paged_prefill
-                else self._qo_indptr_buf
-            )
-            cudnn_o_indptr = (
-                _get_cudnn_qo_indptr(self._qo_indptr_buf, q.size(1), out_head_dim)
-                if self._forced_cudnn_paged_prefill
-                else self._qo_indptr_buf
-            )
+            cudnn_qo_indptr = self._qo_indptr_buf
+            cudnn_o_indptr = self._qo_indptr_buf
             cudnn_batch_prefill_with_kv_cache(
                 q,
                 k_cache,  # Need to be changed

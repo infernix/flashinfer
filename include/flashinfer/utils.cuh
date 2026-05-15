@@ -382,6 +382,9 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim) {
+  if (head_dim >= 512) {
+    return 16;
+  }
   if (avg_packed_qo_len > 64 && head_dim < 256) {
     return 128;
   } else {
