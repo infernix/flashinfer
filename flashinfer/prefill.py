@@ -58,6 +58,7 @@ from .utils import (
     device_support_pdl,
     get_device_sm_count,
     is_float8,
+    is_sm90a_supported,
     is_sm100a_supported,
     is_sm110a_supported,
     is_sm12x_supported,
@@ -1367,6 +1368,77 @@ def _compute_page_mask_indptr(
     )
     return mask_indptr
 
+ 
+def _should_force_cudnn_for_paged_prefill(
+    backend: str,
+    device: torch.device,
+    kv_layout: str,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    use_custom_mask: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    q_data_type: torch.dtype,
+    kv_data_type: torch.dtype,
+    o_data_type: torch.dtype,
+) -> bool:
+    if backend not in ("auto", "fa2"):
+        return False
+    if is_sm90a_supported(device):
+        return False
+    if kv_layout != "NHD" or head_dim_qk != 512 or head_dim_vo != 512:
+        return False
+    if (
+        pos_encoding_mode != "NONE"
+        or use_fp16_qk_reduction
+        or use_custom_mask
+        or window_left >= 0
+        or logits_soft_cap != 0.0
+    ):
+        return False
+    supported_dtypes = (torch.float16, torch.bfloat16)
+    return (
+        q_data_type in supported_dtypes
+        and kv_data_type in supported_dtypes
+        and o_data_type in supported_dtypes
+    )
+
+
+def _build_paged_block_tables(
+    paged_kv_indptr_host: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    kv_lens_arr_host: torch.Tensor,
+    page_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    blocks_per_seq = [
+        (int(seq_len) + page_size - 1) // page_size for seq_len in kv_lens_arr_host
+    ]
+    max_num_blocks_per_seq = max(blocks_per_seq)
+    block_tables = torch.zeros(
+        (len(blocks_per_seq), max_num_blocks_per_seq),
+        dtype=torch.int,
+        device=device,
+    )
+    block_id = int(paged_kv_indptr_host[0])
+    for i, num_blocks_needed in enumerate(blocks_per_seq):
+        block_tables[i, :num_blocks_needed] = paged_kv_indices[
+            block_id : block_id + num_blocks_needed
+        ]
+        block_id += num_blocks_needed
+    return block_tables
+
+
+def _get_cudnn_qo_indptr(
+    qo_indptr_host: torch.Tensor, num_qo_heads: int, head_dim_qk: int
+) -> torch.Tensor:
+    return (qo_indptr_host.to(torch.int64) * (num_qo_heads * head_dim_qk)).to(
+        torch.int32
+    )
+
+
 
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with paged kv-cache for batch of
@@ -1631,6 +1703,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
+        self._requested_backend = backend
         self._backend = backend
         self._plan_info = None
         self._cached_module = None
@@ -1866,6 +1939,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
+        paged_kv_indptr_host = None
+        paged_kv_last_page_len_host = None
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
@@ -1873,17 +1948,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
 
+        if seq_lens is None:
+            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
+            kv_lens_arr_host = get_seq_lens(
+                paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
+            )
+        else:
+            kv_lens_arr_host = seq_lens.cpu().flatten()
+
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
         else:
-            paged_kv_indptr_host = paged_kv_indptr.to("cpu")
-            paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
-            if seq_lens is None:
-                kv_lens_arr_host = get_seq_lens(
-                    paged_kv_indptr_host, paged_kv_last_page_len_host, page_size
-                )
-            else:
-                kv_lens_arr_host = seq_lens.cpu().flatten()
             required_size = len(kv_lens_arr_host)
             if required_size > self._kv_lens_buffer.shape[0]:
                 self._kv_lens_buffer = torch.empty(
@@ -1969,11 +2045,29 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
         self._cached_o_data_type = o_data_type
+        self._backend = self._requested_backend
+        self._cached_module = None
 
         if self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
+            if _should_force_cudnn_for_paged_prefill(
+                self._backend,
+                self.device,
+                self._kv_layout,
+                head_dim_qk,
+                head_dim_vo,
+                pos_encoding_mode,
+                use_fp16_qk_reduction,
+                self._custom_mask_buf is not None,
+                window_left,
+                logits_soft_cap,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+            ):
+                self._backend = "cudnn"
+            elif self._backend == "auto":
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -2000,8 +2094,35 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        if self._backend in ("cudnn", "trtllm-gen"):
+            if paged_kv_indptr_host is None or paged_kv_last_page_len_host is None:
+                paged_kv_indptr_host = paged_kv_indptr.to("cpu")
+                paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
         self._block_tables = block_tables
-        if self._backend == "trtllm-gen":
+        if self._backend == "cudnn":
+            if self._block_tables is None:
+                self._block_tables = _build_paged_block_tables(
+                    paged_kv_indptr_host,
+                    self._paged_kv_indices_buf,
+                    kv_lens_arr_host,
+                    page_size,
+                    self.device,
+                )
+            elif self._block_tables.device != self.device:
+                self._block_tables = self._block_tables.to(
+                    self.device, non_blocking=non_blocking
+                )
+            qo_indptr_cudnn = _get_cudnn_qo_indptr(
+                qo_indptr_host, num_qo_heads, head_dim_qk
+            )
+            self._qo_indptr_last = int(qo_indptr_cudnn[-1])
+            if self.is_cuda_graph_enabled:
+                self._qo_indptr_buf.copy_(qo_indptr_cudnn, non_blocking=non_blocking)
+            else:
+                self._qo_indptr_buf = qo_indptr_cudnn.to(
+                    self.device, non_blocking=non_blocking
+                )
+        elif self._backend == "trtllm-gen":
             if not causal:
                 raise NotImplementedError(
                     "Non-causal attention is not supported for trtllm-gen backend with paged KV cache. "
@@ -2009,27 +2130,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             assert logits_soft_cap == 0.0
             if self._block_tables is None:
-                blocks_per_seq = [
-                    (seq_len + page_size - 1) // page_size
-                    for seq_len in kv_lens_arr_host
-                ]
-                max_num_blocks_per_seq = max(blocks_per_seq)
-                self._block_tables = torch.zeros(
-                    (batch_size, max_num_blocks_per_seq),
-                    dtype=torch.int,
-                    device=self.device,
+                self._block_tables = _build_paged_block_tables(
+                    paged_kv_indptr_host,
+                    self._paged_kv_indices_buf,
+                    kv_lens_arr_host,
+                    page_size,
+                    self.device,
                 )
-                block_id = paged_kv_indptr_host[0]
-                for i in range(batch_size):
-                    num_blocks_needed = blocks_per_seq[i]
-                    assert self._block_tables is not None, (
-                        "block_tables is not initialized"
-                    )
-                    self._block_tables[i, :num_blocks_needed] = paged_kv_indices[
-                        block_id : block_id + num_blocks_needed
-                    ]
-                    block_id += num_blocks_needed
-
         if self._cached_module is not None:
             args = [
                 self._float_workspace_buffer,
@@ -2334,6 +2441,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
         if self._backend == "cudnn":
+            if sinks is not None:
+                raise NotImplementedError(
+                    "cudnn backend does not support sinks for paged KV prefill"
+                )
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
@@ -2344,7 +2455,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q,
                 k_cache,  # Need to be changed
                 v_cache,  # Need to be changed
-                self._sm_scale,
+                sm_scale,
                 self._float_workspace_buffer,
                 actual_seq_lens_q=self._seq_lens_q,
                 actual_seq_lens_kv=self._seq_lens_kv,

@@ -243,3 +243,111 @@ def test_tensor_core_decode_falls_back_for_large_head_dim_bfloat16(use_cuda_grap
         1.0 / math.sqrt(head_dim),
     )
     torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_paged_prefill_selects_cudnn_for_large_head_dim(use_cuda_graph):
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device)[0] != 8:
+        pytest.skip("regression targets non-hopper FA2 devices")
+
+    batch_size = 2
+    qo_len = 4
+    kv_len = 8
+    page_size = 1
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 512
+
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    paged_kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * kv_len
+    paged_kv_indices = torch.arange(batch_size * kv_len, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    if use_cuda_graph:
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
+            paged_kv_indptr_buf=torch.empty(
+                batch_size + 1, dtype=torch.int32, device=device
+            ),
+            paged_kv_indices_buf=torch.empty(
+                batch_size * kv_len, dtype=torch.int32, device=device
+            ),
+            paged_kv_last_page_len_buf=torch.empty(
+                batch_size, dtype=torch.int32, device=device
+            ),
+            backend="auto",
+        )
+    else:
+        wrapper = BatchPrefillWithPagedKVCacheWrapper(
+            workspace_buffer,
+            backend="auto",
+        )
+
+    wrapper.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        head_dim_vo=head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        causal=True,
+    )
+
+    expected_qo_indptr_last = int(qo_indptr[-1]) * num_qo_heads * head_dim
+    assert wrapper._backend == "cudnn"
+    assert wrapper._qo_indptr_last == expected_qo_indptr_last
+    assert wrapper._qo_indptr_buf[-1].item() == expected_qo_indptr_last
+    assert wrapper._block_tables is not None
+    assert wrapper._block_tables.shape == (batch_size, kv_len)
+
+
+def test_paged_prefill_cudnn_fallback_rejects_sinks():
+    device = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(device)[0] != 8:
+        pytest.skip("regression targets non-hopper FA2 devices")
+
+    batch_size = 2
+    qo_len = 4
+    kv_len = 8
+    page_size = 1
+    num_qo_heads = 8
+    num_kv_heads = 2
+    head_dim = 512
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, backend="auto")
+    qo_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len
+    paged_kv_indptr = torch.arange(0, batch_size + 1, dtype=torch.int32) * kv_len
+    paged_kv_indices = torch.arange(batch_size * kv_len, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+    q = torch.randn(batch_size * qo_len, num_qo_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k_cache = torch.randn(
+        batch_size * kv_len, page_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_cache = torch.randn_like(k_cache)
+
+    wrapper.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        head_dim_vo=head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        causal=True,
+    )
+
+    with pytest.raises(NotImplementedError, match="does not support sinks"):
+        wrapper.run(q, (k_cache, v_cache), sinks=torch.zeros(1, device=device))
